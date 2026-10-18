@@ -18,6 +18,7 @@ import { useOrders } from "@/features/order/hooks/useOrders";
 import { useOrderExpiry } from "@/features/order/hooks/useOrderExpiry";
 import { ApiError } from "@/lib/api";
 import { canCancelOrder } from "@/features/order/utils/canCancelOrder";
+import { getOrderParticipantRole } from "@/features/order/utils/order-access";
 import { createDemoOrder } from "@/features/order/mocks/demo-order";
 import { DEMO_MODE } from "@/config/demo-mode";
 import { CancelOrderModal } from "../components/CancelOrderModal";
@@ -141,7 +142,13 @@ export default function TradePage({ params }: PageProps) {
         } catch (err: unknown) {
             if (requestVersion !== fetchVersionRef.current || eventVersion !== escrowEventVersionRef.current) return;
             console.error("Error fetching order:", err);
-            setErrorMsg("Error loading order details");
+            if (err instanceof ApiError && err.status === 403) {
+                setErrorMsg("You are not authorized to view this trade.");
+            } else if (err instanceof ApiError && err.status === 404) {
+                setErrorMsg("Order not found");
+            } else {
+                setErrorMsg("Error loading order details");
+            }
         } finally {
             if (requestVersion === fetchVersionRef.current && eventVersion === escrowEventVersionRef.current) setIsLoading(false);
         }
@@ -254,10 +261,11 @@ export default function TradePage({ params }: PageProps) {
         );
     }
 
-    const isBuyer = currentUser.userId === order.buyerId;
-    const isSeller = currentUser.userId === order.sellerId;
+    const role = getOrderParticipantRole(order, currentUser.userId);
+    const isBuyer = role === "buyer";
+    const isSeller = role === "seller";
 
-    if (!isBuyer && !isSeller) {
+    if (!role) {
         return (
             <div className="flex h-screen w-full overflow-hidden bg-[#081521]">
                 <Aside />
@@ -272,7 +280,6 @@ export default function TradePage({ params }: PageProps) {
         );
     }
 
-    const role = isBuyer ? "buyer" : "seller";
     const amountVal = parseFloat(order.assetAmount) || 0;
     const priceVal = parseFloat(order.offer?.price || "0") || 0;
     const totalVal = parseFloat(order.fiatAmount) || (amountVal * priceVal);
