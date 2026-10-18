@@ -1,16 +1,20 @@
 "use client";
 
-import { use, useEffect, useState, useCallback } from "react";
+import { use, useEffect, useState, useCallback, useRef } from "react";
 import { Aside } from "@/app/components/Aside";
 import { Header } from "@/app/components/Header";
 import { TradeDetails } from "../components/TradeDetails";
+import { OrderStatusTimeline } from "../components/OrderStatusTimeline";
+import { OrderStatusHistory } from "@/features/order/components/OrderStatusHistory";
 import dynamic from "next/dynamic";
 const TradeEvidenceUploader = dynamic(() => import("../components/TradeEvidenceUploader").then((mod) => mod.TradeEvidenceUploader), { ssr: false });
 const EvidencePreview = dynamic(() => import("../components/EvidencePreview").then((mod) => mod.EvidencePreview), { ssr: false });
 const Chat = dynamic(() => import("../../components/Chat").then((mod) => mod.Chat), { ssr: false });
+import { TradeSafetyControls } from "../../components/TradeSafetyControls";
 import { useUser } from "@/features/user/presentation/context/UserContext";
 import type { Order } from "@/features/order/models/order";
 import { useOrders } from "@/features/order/hooks/useOrders";
+import { useOrderExpiry } from "@/features/order/hooks/useOrderExpiry";
 import { ApiError } from "@/lib/api";
 import { canCancelOrder } from "@/features/order/utils/canCancelOrder";
 import { createDemoOrder } from "@/features/order/mocks/demo-order";
@@ -18,8 +22,66 @@ import { DEMO_MODE } from "@/config/demo-mode";
 import { CancelOrderModal } from "../components/CancelOrderModal";
 import { useNotifications } from "@/features/notifications";
 import { useEscrowStatusSync } from "@/features/escrow/hooks/useEscrowStatusSync";
+import type { EscrowStatusEvent } from "@/features/escrow/types/escrow-events.types";
+import { getEscrowStatusPresentation } from "@/features/escrow/utils/escrow-status.utils";
 import { ArrowLeft, AlertTriangle, Ban, Loader2, RefreshCw } from "lucide-react";
 import Link from "next/link";
+
+interface OnChainSnapshot {
+    onChainBalance?: unknown;
+    onChainData?: unknown;
+}
+
+function OnChainEscrowDetails({ escrowId, expectedAmount, assetCode }: { escrowId?: string; expectedAmount?: string; assetCode: string }) {
+    const { accessToken } = useUser();
+    const [snapshot, setSnapshot] = useState<OnChainSnapshot | null>(null);
+    const [failed, setFailed] = useState(false);
+
+    useEffect(() => {
+        if (!escrowId) return;
+        const controller = new AbortController();
+        const headers: Record<string, string> = {};
+        if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+        fetch(`${process.env.NEXT_PUBLIC_API_URL}/escrows/${escrowId}/status`, { headers, signal: controller.signal })
+            .then(async response => {
+                if (!response.ok) throw new Error("On-chain state unavailable");
+                return response.json() as Promise<OnChainSnapshot>;
+            })
+            .then(setSnapshot)
+            .catch(error => {
+                if (error instanceof DOMException && error.name === "AbortError") return;
+                setFailed(true);
+            });
+        return () => controller.abort();
+    }, [escrowId, accessToken]);
+
+    if (!escrowId) return null;
+    const balances = Array.isArray(snapshot?.onChainBalance) ? snapshot.onChainBalance as Record<string, unknown>[] : [];
+    const actualBalance = balances.find(item => item.balance !== null && item.balance !== undefined)?.balance
+        ?? (typeof snapshot?.onChainBalance === "number" || typeof snapshot?.onChainBalance === "string" ? snapshot.onChainBalance : null);
+    const chainEntries = Array.isArray(snapshot?.onChainData) ? snapshot.onChainData as Record<string, unknown>[] : [];
+    const milestones = Array.isArray(chainEntries[0]?.milestones) ? chainEntries[0].milestones as Record<string, unknown>[] : [];
+
+    return (
+        <section aria-label="On-chain escrow details" className="w-full rounded-xl border border-[#263949] bg-[#0D1D2C] p-4 text-sm">
+            <h3 className="mb-3 font-bold text-white">On-chain escrow details</h3>
+            {failed ? <p className="text-amber-300">Current chain data could not be loaded.</p> : (
+                <div className="space-y-2 text-[#C2C7D0]">
+                    <p>Expected amount: <strong className="text-white">{expectedAmount || "Unavailable"} {assetCode}</strong></p>
+                    <p>On-chain balance: <strong className="text-white">{actualBalance === null ? "Unavailable" : `${actualBalance} ${assetCode}`}</strong></p>
+                    <div>
+                        <span>Milestones: </span>
+                        {milestones.length ? milestones.map((milestone, index) => (
+                            <span key={index} className="mr-2 text-white">
+                                {String(milestone.title ?? milestone.name ?? `Milestone ${index + 1}`)} — {String(milestone.status ?? "status unavailable")}
+                            </span>
+                        )) : <span>Unavailable</span>}
+                    </div>
+                </div>
+            )}
+        </section>
+    );
+}
 
 interface PageProps {
     params: Promise<{ orderId: string }>;
@@ -41,6 +103,8 @@ export default function TradePage({ params }: PageProps) {
     const [errorMsg, setErrorMsg] = useState("");
     const [showCancelModal, setShowCancelModal] = useState(false);
     const [isCancelling, setIsCancelling] = useState(false);
+    const fetchVersionRef = useRef(0);
+    const escrowEventVersionRef = useRef(0);
 
     // Demo orders are only fabricated when the demo flag is on. With the flag
     // off (production), /demo and mock-* ids fall through to the real order
@@ -48,6 +112,8 @@ export default function TradePage({ params }: PageProps) {
     const isDemoOrder = DEMO_MODE && (orderId === "demo" || orderId.startsWith("mock-"));
 
     const fetchOrder = useCallback(async () => {
+        const requestVersion = ++fetchVersionRef.current;
+        const eventVersion = escrowEventVersionRef.current;
         if (isDemoOrder && currentUser) {
             setOrder(createDemoOrder(currentUser));
             setIsLoading(false);
@@ -57,18 +123,30 @@ export default function TradePage({ params }: PageProps) {
         try {
             const dashedId = restoreUuidDashes(orderId);
             const data = await getOrder(dashedId);
+            if (requestVersion !== fetchVersionRef.current || eventVersion !== escrowEventVersionRef.current) return;
             if (!data) {
                 setErrorMsg("Order not found");
             } else {
-                setOrder(data);
+                setOrder((previous) => {
+                    const previousStatus = previous?.escrow?.escrowStatus;
+                    const incomingStatus = data.escrow?.escrowStatus;
+                    const previousTerminal = previousStatus === "released" || previousStatus === "resolved";
+                    const incomingTerminal = incomingStatus === "released" || incomingStatus === "resolved";
+                    return previousTerminal && !incomingTerminal ? previous : data;
+                });
             }
         } catch (err: unknown) {
+            if (requestVersion !== fetchVersionRef.current || eventVersion !== escrowEventVersionRef.current) return;
             console.error("Error fetching order:", err);
             setErrorMsg("Error loading order details");
         } finally {
-            setIsLoading(false);
+            if (requestVersion === fetchVersionRef.current && eventVersion === escrowEventVersionRef.current) setIsLoading(false);
         }
     }, [orderId, getOrder, isDemoOrder, currentUser]);
+
+    const expiry = useOrderExpiry(order?.expiresAt, () => {
+        void fetchOrder();
+    });
 
     useEffect(() => {
         if (currentUser) {
@@ -78,11 +156,15 @@ export default function TradePage({ params }: PageProps) {
 
     // Escrow status sync — kept separate from fetchOrder so that only
     // the escrow event triggers a refetch, not every render.
-    const handleEscrowStatusChange = useCallback(async () => {
+    const handleEscrowStatusChange = useCallback(async (event: EscrowStatusEvent) => {
+        escrowEventVersionRef.current += 1;
+        setOrder((previous) => previous?.escrow
+            ? { ...previous, escrow: { ...previous.escrow, escrowStatus: event.status } }
+            : previous);
         await fetchOrder();
     }, [fetchOrder]);
 
-    const { syncState } = useEscrowStatusSync({
+    const { syncState, refresh } = useEscrowStatusSync({
         orderId,
         escrowId: order?.escrow?.escrowId,
         onStatusChange: handleEscrowStatusChange,
@@ -92,6 +174,13 @@ export default function TradePage({ params }: PageProps) {
     const handleCancelOrder = useCallback(async () => {
         if (!order || isDemoOrder) {
             setShowCancelModal(false);
+            return;
+        }
+
+        if (!canCancelOrder(order, currentUser?.userId ?? "")) {
+            setShowCancelModal(false);
+            notify("warning", "This order can no longer be cancelled because its status has changed.");
+            await fetchOrder();
             return;
         }
 
@@ -116,7 +205,7 @@ export default function TradePage({ params }: PageProps) {
         } finally {
             setIsCancelling(false);
         }
-    }, [order, isDemoOrder, cancelOrder, notify, fetchOrder]);
+    }, [order, isDemoOrder, currentUser, cancelOrder, notify, fetchOrder]);
 
     if (!currentUser) {
         return (
@@ -124,7 +213,7 @@ export default function TradePage({ params }: PageProps) {
                 <Aside />
                 <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
                     <Header description="trading floor" title="p2p marketplace" />
-                    <main className="flex flex-col items-center justify-center flex-1 bg-[#081521]">
+                    <main id="main-content" tabIndex={-1} className="flex flex-col items-center justify-center flex-1 bg-[#081521]">
                         <p className="text-white text-lg font-bold font-space">Please log in to view this trade.</p>
                     </main>
                 </div>
@@ -138,7 +227,7 @@ export default function TradePage({ params }: PageProps) {
                 <Aside />
                 <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
                     <Header description="trading floor" title="p2p marketplace" />
-                    <main className="flex flex-col items-center justify-center flex-1 bg-[#081521]">
+                    <main id="main-content" tabIndex={-1} className="flex flex-col items-center justify-center flex-1 bg-[#081521]">
                         <Loader2 className="animate-spin h-12 w-12 text-[#55D6BE]" />
                         <p className="text-[#C2C7D0] mt-4 font-semibold font-space">Loading transaction details...</p>
                     </main>
@@ -153,7 +242,7 @@ export default function TradePage({ params }: PageProps) {
                 <Aside />
                 <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
                     <Header description="trading floor" title="p2p marketplace" />
-                    <main className="flex flex-col items-center justify-center flex-1 bg-[#081521]">
+                    <main id="main-content" tabIndex={-1} className="flex flex-col items-center justify-center flex-1 bg-[#081521]">
                         <AlertTriangle className="w-12 h-12 text-[#55D6BE] mb-2" />
                         <p className="text-white text-lg font-bold font-space">{errorMsg || "Transaction details unavailable"}</p>
                     </main>
@@ -171,7 +260,7 @@ export default function TradePage({ params }: PageProps) {
                 <Aside />
                 <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
                     <Header description="trading floor" title="p2p marketplace" />
-                    <main className="flex flex-col items-center justify-center flex-1 bg-[#081521]">
+                    <main id="main-content" tabIndex={-1} className="flex flex-col items-center justify-center flex-1 bg-[#081521]">
                         <Ban className="w-12 h-12 text-red-500 mb-2" />
                         <p className="text-white text-lg font-bold font-space">You are not authorized to view this trade.</p>
                     </main>
@@ -213,8 +302,15 @@ export default function TradePage({ params }: PageProps) {
 
     const escrowId = order.escrow?.escrowId;
     const escrowStatus = order.escrow?.escrowStatus || "pending";
+    const statusPresentation = getEscrowStatusPresentation(escrowStatus, role);
     const buyerAddress = order.escrow?.buyerAddress || order.buyer?.publicKey;
     const sellerAddress = order.escrow?.sellerAddress || order.seller?.publicKey;
+    const explorerNetwork = (process.env.NEXT_PUBLIC_STELLAR_NETWORK || "testnet").toLowerCase();
+    const explorerNetworkPath = explorerNetwork === "public" || explorerNetwork === "mainnet" ? "public" : "testnet";
+    const escrowTransactions = [
+        { label: "Escrow locked", hash: order.escrow?.txHashLock },
+        { label: "Escrow released", hash: order.escrow?.txHashRelease },
+    ].filter((transaction): transaction is { label: string; hash: string } => Boolean(transaction.hash));
 
     const counterpartyUser = isBuyer ? order.seller : order.buyer;
     const isCompleted = order.escrow?.escrowStatus === 'released';
@@ -225,7 +321,12 @@ export default function TradePage({ params }: PageProps) {
             <Aside />
             <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
                 <Header description="trading floor" title="p2p marketplace" />
-                <main className="flex flex-col md:flex-row items-start w-full h-[calc(100vh-96px)] overflow-hidden bg-[#081521] min-h-0 select-none">
+                {isDemoOrder && (
+                    <div role="status" className="border-b border-amber-400/30 bg-amber-400/10 px-4 py-2 text-center text-sm font-semibold text-amber-100">
+                        Demo mode — simulated order only. No real Stellar or fiat transfer will occur.
+                    </div>
+                )}
+                <main id="main-content" tabIndex={-1} className="flex flex-col md:flex-row items-start w-full h-[calc(100vh-96px)] overflow-hidden bg-[#081521] min-h-0 select-none">
                     
                     {/* COLUMNA IZQUIERDA: Panel de Transacción */}
                     <div className="w-full md:w-[1172px] h-full flex flex-col border-r border-[rgba(69,73,50,0.1)] bg-[#081521] shrink-0 min-h-0">
@@ -239,14 +340,10 @@ export default function TradePage({ params }: PageProps) {
                                 <ArrowLeft className="w-4 h-4 text-[#9CA3AF] stroke-[3px]" /> BACK TO ORDERS
                             </Link>
                             <div className="flex items-center gap-3 select-none">
-                                {!isCompleted && (
-                                    <>
-                                        <span className="w-2 h-2 rounded-full bg-[#55D6BE] animate-pulse shadow-[0_0_8px_rgba(218,255,0,0.6)]" />
-                                        <span className="text-[#55D6BE] text-[12px] font-bold tracking-[2.4px] uppercase font-space">
-                                            TRANSACTION IN PROGRESS
-                                        </span>
-                                    </>
-                                )}
+                                <span className={`w-2 h-2 rounded-full ${isCompleted ? "bg-[#55D6BE]" : "bg-[#55D6BE] animate-pulse"}`} />
+                                <span className="text-[#55D6BE] text-[12px] font-bold tracking-[2.4px] uppercase font-space" aria-label={`${statusPresentation.label}. ${statusPresentation.action}`}>
+                                    {statusPresentation.label}
+                                </span>
                                 {syncState.status === "reconnecting" && (
                                     <span className="flex items-center gap-1 text-[#9CA3AF] text-[10px] font-medium uppercase tracking-wider font-space">
                                         <RefreshCw className="w-3 h-3 animate-spin" />
@@ -258,6 +355,26 @@ export default function TradePage({ params }: PageProps) {
                                         Sync issue — will retry
                                     </span>
                                 )}
+{order?.escrow?.escrowId && !isCompleted && (
+                                    <button
+                                        type="button"
+                                        onClick={refresh}
+                                        disabled={syncState.status === "syncing"}
+                                        aria-label="Refresh escrow status"
+                                        className="flex items-center gap-1 text-[#9CA3AF] hover:text-[#55D6BE] text-[10px] font-medium disabled:opacity-50"
+                                    >
+                                        <RefreshCw className="w-3 h-3" /> Refresh status
+                                    </button>
+                                )}
+                                {expiry.hasExpiry && (
+                                    <span
+                                        role="timer"
+                                        aria-label={`Order ${expiry.label.toLowerCase()}`}
+                                        className={`text-[11px] font-bold uppercase tracking-wider font-space ${expiry.isExpired ? "text-red-400" : "text-[#C2C7D0]"}`}
+                                    >
+                                        {expiry.isExpired ? "EXPIRED" : `${expiry.label} REMAINING`}
+                                    </span>
+                                )}              )}
                             </div>
                             <div className="flex items-center gap-4">
                                 <h2 className="text-white font-black text-[20px] leading-7 uppercase tracking-normal font-space hidden md:block">
@@ -266,8 +383,17 @@ export default function TradePage({ params }: PageProps) {
                             </div>
                         </div>
 
+                        {order?.escrow?.escrowId && (
+                            <p className="px-4 md:px-[60px] pb-2 text-[#9CA3AF] text-[11px]" aria-live="polite">
+                                Status source: {syncState.source === "websocket" ? "live connection" : syncState.source === "polling" ? "periodic refresh" : "waiting for update"}
+                                {syncState.lastUpdated && ` · Last updated ${new Date(syncState.lastUpdated).toLocaleString()}`}
+                            </p>
+                        )}
+
                         {/* Contenedor Principal Escalado por Rol */}
                         <div className="grow flex flex-col p-4 md:p-[32px_64px_40px_64px] overflow-auto justify-between items-center min-h-0 w-full">
+                            <OrderStatusTimeline status={escrowStatus} role={role} />
+                            <OrderStatusHistory orderId={order.orderId} />
                             
                             {isBuyer ? (
                                 <div className="flex flex-col items-center justify-center h-full w-full">
@@ -275,7 +401,7 @@ export default function TradePage({ params }: PageProps) {
                                         <div className="w-full md:w-[616.2px] h-full shrink-0">
                                             <TradeDetails 
                                                 role={role}
-                                                amount={amountVal}
+                                                amount={totalVal}
                                                 assetCode={order.offer?.assetCode || "USDC"}
                                                 unitPrice={priceVal}
                                                 total={totalVal}
@@ -296,11 +422,16 @@ export default function TradePage({ params }: PageProps) {
                                                 escrowStatus={escrowStatus}
                                                 buyerAddress={buyerAddress}
                                                 amount={amountVal}
+                                                currency={order.seller?.preferredCurrency || "USD"}
+                                                recipientName={accountOwner}
+                                                isBuyer={isBuyer}
                                                 evidenceUrl={order.escrow?.evidenceUrl}
                                                 onStatusChange={fetchOrder}
-                                                canCancel={canCancel}
+                                                refreshStatus={refresh}
+                                                canCancel={canCancel && !expiry.isExpired}
                                                 isCancelling={isCancelling}
                                                 onCancelOrder={() => setShowCancelModal(true)}
+                                                isExpired={expiry.isExpired}
                                             />
                                         </div>
                                     </div>
@@ -322,11 +453,11 @@ export default function TradePage({ params }: PageProps) {
                                                 </span>
                                             </div>
                                             <div className="flex flex-col items-end justify-center">
-                                                <span className="text-white font-black text-[28px] font-space leading-none tracking-wide">
-                                                    14:52
+                                                <span className="text-white font-black text-[18px] font-space leading-none tracking-wide">
+                                                    {expiry.hasExpiry ? expiry.label : "—"}
                                                 </span>
                                                 <span className="text-[#9CA3AF] text-[10px] font-bold uppercase tracking-[1px] font-space mt-1">
-                                                    REMAINING TIME
+                                                    {expiry.hasExpiry ? (expiry.isExpired ? "ORDER EXPIRED" : "REMAINING TIME") : "EXPIRY UNAVAILABLE"}
                                                 </span>
                                             </div>
                                         </div>
@@ -356,9 +487,11 @@ export default function TradePage({ params }: PageProps) {
                                             expiresAt={order.expiresAt as string | undefined}
                                             evidenceUrl={order.escrow?.evidenceUrl}
                                             onStatusChange={fetchOrder}
-                                            canCancel={canCancel}
+                                            refreshStatus={refresh}
+                                            canCancel={canCancel && !expiry.isExpired}
                                             isCancelling={isCancelling}
                                             onCancelOrder={() => setShowCancelModal(true)}
+                                            orderExpired={expiry.isExpired}
                                         />
                                     </div>
 
@@ -375,15 +508,29 @@ export default function TradePage({ params }: PageProps) {
                                             ). Third-party payments are against our terms of service.
                                         </p>
                                     </div>
-                                    
-                                    <div className="w-full flex flex-row items-center justify-end pt-2 shrink-0">
-                                        <button className="text-[#FF6B6B] hover:text-red-400 font-bold font-space uppercase text-[14px] tracking-[0.5px] transition-colors cursor-pointer">
-                                            Report Issue
-                                        </button>
-                                    </div>
+
+                                    {escrowTransactions.length > 0 && (
+                                        <section aria-labelledby="escrow-transactions-title" className="w-full rounded-xl border border-[#172B3A] bg-[#0D1D2C] p-5">
+                                            <h3 id="escrow-transactions-title" className="mb-3 text-sm font-bold uppercase tracking-wide text-white">Escrow transactions</h3>
+                                            <ul className="space-y-2">
+                                                {escrowTransactions.map(({ label, hash }) => (
+                                                    <li key={label}>
+                                                        <a className="text-sm text-[#55D6BE] underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2" href={`https://stellar.expert/explorer/${explorerNetworkPath}/tx/${encodeURIComponent(hash)}`} target="_blank" rel="noopener noreferrer">
+                                                            {label}: {hash}
+                                                        </a>
+                                                    </li>
+                                                ))}
+                                            </ul>
+                                        </section>
+                                    )}
                                     
                                 </div>
                             )}
+                            <OnChainEscrowDetails
+                                escrowId={escrowId}
+                                expectedAmount={order.assetAmount}
+                                assetCode={order.offer?.assetCode || "USDC"}
+                            />
                         </div>
                     </div>
 
@@ -394,6 +541,7 @@ export default function TradePage({ params }: PageProps) {
                             chatName={counterpartyUser?.alias || (isBuyer ? "Seller" : "Buyer")} 
                             counterpartyProfileImageUrl={counterpartyUser?.profileImageUrl}
                         />
+                        <TradeSafetyControls orderId={order.orderId} counterpartyId={counterpartyUser?.userId || ""} />
                     </div>
                 </main>
             </div>
@@ -403,6 +551,7 @@ export default function TradePage({ params }: PageProps) {
                     onConfirm={handleCancelOrder}
                     onClose={() => setShowCancelModal(false)}
                     isCancelling={isCancelling}
+                    canCancel={canCancel}
                 />
             )}
         </div>

@@ -21,6 +21,54 @@ type ChatProps = {
     counterpartyProfileImageUrl?: string;
 };
 
+/** Render chat text as text, turning only validated web URLs into links. */
+const renderMessageContent = (content: string) => {
+    const urlPattern = /https?:\/\/[^\s<>"']+/gi;
+    const parts: React.ReactNode[] = [];
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+
+    while ((match = urlPattern.exec(content)) !== null) {
+        let candidate = match[0];
+        // Sentence punctuation is usually not part of a pasted URL.
+        const trailing = candidate.match(/[.,!?;:]+$/)?.[0] ?? "";
+        if (trailing) candidate = candidate.slice(0, -trailing.length);
+
+        let safeHref: string | null = null;
+        try {
+            const parsed = new URL(candidate);
+            if ((parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.hostname && !parsed.username && !parsed.password) {
+                safeHref = parsed.href;
+            }
+        } catch {
+            // Invalid URLs remain ordinary message text.
+        }
+
+        if (!safeHref || candidate.length === 0) continue;
+
+        const linkStart = match.index;
+        const linkEnd = linkStart + candidate.length;
+        if (linkStart > lastIndex) parts.push(content.slice(lastIndex, linkStart));
+        parts.push(
+            <a
+                key={`link-${linkStart}`}
+                href={safeHref}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline underline-offset-2 break-all"
+            >
+                {candidate}
+            </a>,
+        );
+        if (trailing) parts.push(trailing);
+        lastIndex = linkEnd + trailing.length;
+        urlPattern.lastIndex = lastIndex;
+    }
+
+    if (lastIndex < content.length) parts.push(content.slice(lastIndex));
+    return parts;
+};
+
 export const Chat = ({ orderId, chatName = "Merchant Chat", counterpartyProfileImageUrl }: ChatProps) => {
     const { currentUser, accessToken } = useUser();
     const { notify } = useNotifications();
@@ -30,6 +78,9 @@ export const Chat = ({ orderId, chatName = "Merchant Chat", counterpartyProfileI
     const [historyLoaded, setHistoryLoaded] = useState(false);
     const [isCounterpartyTyping, setIsCounterpartyTyping] = useState(false);
     const messagesEndRef = useRef<HTMLDivElement>(null);
+    const nearBottomRef = useRef(true);
+    const markedReadRef = useRef(new Set<string>());
+    const [readReceiptsEnabled, setReadReceiptsEnabled] = useState(false);
 
     // Demo chat is only reachable when the demo flag is on; otherwise mock ids
     // fall through to the real chat flow (which loads from the backend).
@@ -80,13 +131,43 @@ export const Chat = ({ orderId, chatName = "Merchant Chat", counterpartyProfileI
         [currentUser, mergeMessages, notify],
     );
 
-    const { status: connectionStatus, sendMessage } = useChatSocket({
+    const handleMessageRead = useCallback((event: { orderId: string; messageId: string; readerId: string; readAt: string }) => {
+        if (!currentUser || event.readerId === currentUser.userId) return;
+        setMessages((previous) => previous.map((message) =>
+            message.messageId === event.messageId && message.orderId === event.orderId && message.senderId === currentUser.userId
+                ? { ...message, readAt: event.readAt }
+                : message,
+        ));
+    }, [currentUser]);
+
+    const { status: connectionStatus, sendMessage, markMessageRead } = useChatSocket({
         orderId,
         accessToken,
         enabled: Boolean(currentUser && accessToken && historyLoaded && !isDemo),
         onMessage: handleIncomingMessage,
+        onMessageRead: handleMessageRead,
         onError: handleSocketError,
     });
+
+    useEffect(() => {
+        if (!currentUser) return;
+        const key = `localsettle:chat:read-receipts:${currentUser.userId}`;
+        setReadReceiptsEnabled(window.localStorage.getItem(key) === "true");
+    }, [currentUser?.userId]);
+
+    useEffect(() => {
+        markedReadRef.current.clear();
+        nearBottomRef.current = true;
+    }, [orderId]);
+
+    useEffect(() => {
+        if (!readReceiptsEnabled || !currentUser || isDemo || document.visibilityState !== "visible" || !nearBottomRef.current) return;
+        const unread = messages.filter((message) => message.senderId !== currentUser.userId && !markedReadRef.current.has(message.messageId));
+        for (const message of unread) {
+            markedReadRef.current.add(message.messageId);
+            void markMessageRead(message.messageId).catch(() => markedReadRef.current.delete(message.messageId));
+        }
+    }, [currentUser, isDemo, markMessageRead, messages, readReceiptsEnabled]);
 
     // Load initial messages
     useEffect(() => {
@@ -189,6 +270,21 @@ export const Chat = ({ orderId, chatName = "Merchant Chat", counterpartyProfileI
         }
     };
 
+    const retryMessage = async (message: Message) => {
+        if (!message.clientMessageId || !currentUser || connectionStatus !== "connected") return;
+        setMessages((previous) => previous.map((item) => item.messageId === message.messageId
+            ? { ...item, deliveryStatus: "sending" }
+            : item));
+        try {
+            mergeMessages(await sendMessage(message.content, message.clientMessageId));
+        } catch (error) {
+            setMessages((previous) => previous.map((item) => item.messageId === message.messageId
+                ? { ...item, deliveryStatus: "failed" }
+                : item));
+            notify("error", error instanceof Error ? error.message : "Message could not be sent.");
+        }
+    };
+
     const connectionLabel = isDemo
         ? "Demo chat"
         : ({
@@ -204,7 +300,7 @@ export const Chat = ({ orderId, chatName = "Merchant Chat", counterpartyProfileI
     );
 
     return (
-        <div className="w-full h-full bg-[#0D1D2C] flex flex-col overflow-hidden shrink-0 font-space select-none">
+        <div className="w-full flex-1 min-h-0 bg-[#0D1D2C] flex flex-col overflow-hidden shrink-0 font-space select-none">
             {/* Header */}
             <header className="h-[64px] border-b border-[rgba(69,73,50,0.1)] px-[24px] flex items-center justify-between shrink-0 bg-[#0D1D2C]">
                 <div className="flex items-center gap-3">
@@ -227,13 +323,33 @@ export const Chat = ({ orderId, chatName = "Merchant Chat", counterpartyProfileI
                         </p>
                     </div>
                 </div>
-                <button className="text-[#9BABB7] hover:text-white cursor-pointer px-1">
-                    <MoreVertical className="w-5 h-5 text-[#9BABB7]" />
-                </button>
+                <div className="flex items-center gap-3">
+                    <button
+                        type="button"
+                        aria-pressed={readReceiptsEnabled}
+                        onClick={() => {
+                            const enabled = !readReceiptsEnabled;
+                            setReadReceiptsEnabled(enabled);
+                            if (currentUser) window.localStorage.setItem(`localsettle:chat:read-receipts:${currentUser.userId}`, String(enabled));
+                        }}
+                        className="text-[10px] text-[#9BABB7] hover:text-white"
+                        title="Read receipts are off by default and saved on this device"
+                    >
+                        Read receipts {readReceiptsEnabled ? "On" : "Off"}
+                    </button>
+                    <MoreVertical className="w-5 h-5 text-[#9BABB7]" aria-hidden="true" />
+                </div>
             </header>
+
+            <aside aria-label="Message policy" className="border-b border-white/10 bg-[#11212E] px-6 py-3 text-xs leading-relaxed text-[#C2C7D0]">
+                Sent messages are currently immutable and remain in the order history. To correct a message, send a follow-up; LocalSettle does not silently edit or remove chat records.
+            </aside>
             
             {/* Chat Messages Body */}
-            <main role="log" aria-live="polite" aria-label="Chat messages" className="flex-grow overflow-y-auto p-6 space-y-5 bg-[#0D1D2C]/10 scrollbar-thin flex flex-col">
+            <main onScroll={(event) => {
+                const { scrollTop, scrollHeight, clientHeight } = event.currentTarget;
+                nearBottomRef.current = scrollHeight - scrollTop - clientHeight < 80;
+            }} role="log" aria-live="polite" aria-label="Chat messages" className="flex-grow overflow-y-auto p-6 space-y-5 bg-[#0D1D2C]/10 scrollbar-thin flex flex-col">
                 {/* Order Created status banner */}
                 <section className="flex items-center justify-center my-2 shrink-0">
                     <div className="bg-[#11212E] px-4 py-1.5 flex items-center justify-center rounded-full border border-[rgba(69,73,50,0.2)]">
@@ -261,7 +377,7 @@ export const Chat = ({ orderId, chatName = "Merchant Chat", counterpartyProfileI
                                             : "bg-[#11212E] text-[#C2C7D0] font-medium rounded-bl-[4px] border border-white/[0.01]"
                                     }`}
                                 >
-                                    {msg.content}
+                                    <span className="whitespace-pre-wrap">{renderMessageContent(msg.content)}</span>
                                 </div>
                                 <span className={`text-[9px] font-bold px-1 ${
                                     msg.deliveryStatus === "failed" ? "text-red-400" : "text-[#9BABB7]"
@@ -271,9 +387,14 @@ export const Chat = ({ orderId, chatName = "Merchant Chat", counterpartyProfileI
                                             ? "• Sending…"
                                             : msg.deliveryStatus === "failed"
                                                 ? "• Failed"
-                                                : "• Delivered"
+                                                : msg.readAt ? "• Read" : "• Sent"
                                     )}
                                 </span>
+                                {isOwnMessage && msg.deliveryStatus === "failed" && msg.clientMessageId && (
+                                    <button type="button" onClick={() => void retryMessage(msg)} className="text-[10px] text-[#55D6BE] underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#55D6BE]">
+                                        Retry safely
+                                    </button>
+                                )}
                             </div>
                         );
                     })}
