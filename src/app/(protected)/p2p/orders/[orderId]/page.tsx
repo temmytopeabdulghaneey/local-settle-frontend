@@ -4,6 +4,7 @@ import { use, useEffect, useState, useCallback, useRef } from "react";
 import { Aside } from "@/app/components/Aside";
 import { Header } from "@/app/components/Header";
 import { TradeDetails } from "../components/TradeDetails";
+import { EscrowTransactionLinks } from "../components/EscrowTransactionLinks";
 import { OrderStatusTimeline } from "../components/OrderStatusTimeline";
 import { OrderStatusHistory } from "@/features/order/components/OrderStatusHistory";
 import dynamic from "next/dynamic";
@@ -17,6 +18,7 @@ import { useOrders } from "@/features/order/hooks/useOrders";
 import { useOrderExpiry } from "@/features/order/hooks/useOrderExpiry";
 import { ApiError } from "@/lib/api";
 import { canCancelOrder } from "@/features/order/utils/canCancelOrder";
+import { getOrderParticipantRole } from "@/features/order/utils/order-access";
 import { createDemoOrder } from "@/features/order/mocks/demo-order";
 import { DEMO_MODE } from "@/config/demo-mode";
 import { CancelOrderModal } from "../components/CancelOrderModal";
@@ -140,7 +142,13 @@ export default function TradePage({ params }: PageProps) {
         } catch (err: unknown) {
             if (requestVersion !== fetchVersionRef.current || eventVersion !== escrowEventVersionRef.current) return;
             console.error("Error fetching order:", err);
-            setErrorMsg("Error loading order details");
+            if (err instanceof ApiError && err.status === 403) {
+                setErrorMsg("You are not authorized to view this trade.");
+            } else if (err instanceof ApiError && err.status === 404) {
+                setErrorMsg("Order not found");
+            } else {
+                setErrorMsg("Error loading order details");
+            }
         } finally {
             if (requestVersion === fetchVersionRef.current && eventVersion === escrowEventVersionRef.current) setIsLoading(false);
         }
@@ -253,10 +261,11 @@ export default function TradePage({ params }: PageProps) {
         );
     }
 
-    const isBuyer = currentUser.userId === order.buyerId;
-    const isSeller = currentUser.userId === order.sellerId;
+    const role = getOrderParticipantRole(order, currentUser.userId);
+    const isBuyer = role === "buyer";
+    const isSeller = role === "seller";
 
-    if (!isBuyer && !isSeller) {
+    if (!role) {
         return (
             <div className="flex h-screen w-full overflow-hidden bg-[#081521]">
                 <Aside />
@@ -271,7 +280,6 @@ export default function TradePage({ params }: PageProps) {
         );
     }
 
-    const role = isBuyer ? "buyer" : "seller";
     const amountVal = parseFloat(order.assetAmount) || 0;
     const priceVal = parseFloat(order.offer?.price || "0") || 0;
     const totalVal = parseFloat(order.fiatAmount) || (amountVal * priceVal);
@@ -309,13 +317,6 @@ export default function TradePage({ params }: PageProps) {
     const statusPresentation = getEscrowStatusPresentation(escrowStatus, role);
     const buyerAddress = order.escrow?.buyerAddress || order.buyer?.publicKey;
     const sellerAddress = order.escrow?.sellerAddress || order.seller?.publicKey;
-    const explorerNetwork = (process.env.NEXT_PUBLIC_STELLAR_NETWORK || "testnet").toLowerCase();
-    const explorerNetworkPath = explorerNetwork === "public" || explorerNetwork === "mainnet" ? "public" : "testnet";
-    const escrowTransactions = [
-        { label: "Escrow locked", hash: order.escrow?.txHashLock },
-        { label: "Escrow released", hash: order.escrow?.txHashRelease },
-    ].filter((transaction): transaction is { label: string; hash: string } => Boolean(transaction.hash));
-
     const counterpartyUser = isBuyer ? order.seller : order.buyer;
     const isCompleted = order.escrow?.escrowStatus === 'released';
     const canCancel = canCancelOrder(order, currentUser.userId);
@@ -518,23 +519,12 @@ export default function TradePage({ params }: PageProps) {
                                         <button type="button" onClick={() => setShowDisputeDialog(true)} className="text-[#FF6B6B] hover:text-red-400 font-bold font-space uppercase text-[14px] tracking-[0.5px] transition-colors cursor-pointer">Open dispute</button>
                                     </div>}
 
-                                    {escrowTransactions.length > 0 && (
-                                        <section aria-labelledby="escrow-transactions-title" className="w-full rounded-xl border border-[#172B3A] bg-[#0D1D2C] p-5">
-                                            <h3 id="escrow-transactions-title" className="mb-3 text-sm font-bold uppercase tracking-wide text-white">Escrow transactions</h3>
-                                            <ul className="space-y-2">
-                                                {escrowTransactions.map(({ label, hash }) => (
-                                                    <li key={label}>
-                                                        <a className="text-sm text-[#55D6BE] underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2" href={`https://stellar.expert/explorer/${explorerNetworkPath}/tx/${encodeURIComponent(hash)}`} target="_blank" rel="noopener noreferrer">
-                                                            {label}: {hash}
-                                                        </a>
-                                                    </li>
-                                                ))}
-                                            </ul>
-                                        </section>
-                                    )}
-                                    
                                 </div>
                             )}
+                            <EscrowTransactionLinks
+                                txHashLock={order.escrow?.txHashLock}
+                                txHashRelease={order.escrow?.txHashRelease}
+                            />
                             <OnChainEscrowDetails
                                 escrowId={escrowId}
                                 expectedAmount={order.assetAmount}
